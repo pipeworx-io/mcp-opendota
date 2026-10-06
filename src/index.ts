@@ -674,7 +674,39 @@ function collapse(s: string): string {
  * OpenDota MCP — Dota 2 open stats.
  *
  * Hero meta (pick/win rates), recent professional matches, player search and
- * profiles (rank, win/loss). Keyless; free tier rate-limited (~60 req/min).
+ * profiles (rank, win/loss). Keyless; free tier rate-limited (~60 req/min, 2k/day
+ * per IP — see https://www.opendota.com/api-keys).
+ *
+ * Fleet #2709 (2026-10-06): a stuck-class check flagged opendota_get_player at
+ * 100% `upstream_throttled` over 7 days with zero successes, reported against a
+ * belief that the upstream "answers 200". Live repro (pwcall + a direct curl to
+ * api.opendota.com for the same account id, run seconds apart) showed the
+ * gateway's own fetch genuinely receiving HTTP 429 every time, while the curl
+ * from a plain laptop IP got 200 with `x-rate-limit-remaining-minute: 59` —
+ * nowhere near its own budget. That is NOT a classifier bug (`upstream_throttled`
+ * is the correct class for a real 429; see classifyToolError in
+ * workers/gateway/src/error-class.ts) — it is the shared-Cloudflare-egress
+ * pattern already catalogued for thespacedevs/launchlibrary and macvendors in
+ * docs/paid-upgrade-watchlist.md: OpenDota rate-limits by calling IP, and the
+ * Worker's egress IP pool is shared with unrelated Cloudflare traffic that has
+ * already spent the quota before our request lands. AE confirms it's whole-pack,
+ * not just this tool (hero_stats and pro_matches throttled too, 7d window).
+ * Retrying inside the same request does not help — OpenDota's limit resets on a
+ * ~60s window shared with that same traffic, and repro calls spaced 2s to 5+ min
+ * apart were throttled identically, so a short in-request backoff (the usaspending
+ * `retryFetch` pattern this file's pwFetch comment mirrors) would only add
+ * latency with no realistic chance of landing inside a clear window — which is
+ * why that shared helper retries only on 5xx, never on 429.
+ *
+ * The durable fix is OpenDota's key tier, which is tracked PER KEY rather than
+ * per shared IP (components.securitySchemes.api_key in their OpenAPI spec; free,
+ * registration is Steam-login-gated at opendota.com/api-keys, so getting one
+ * needs a human with a Steam account, not a Pipeworx credential). Until a
+ * platform key exists, `_apiKey` is wired as an OPTIONAL caller-supplied
+ * enhancer (same shape as colombia-secop's Socrata token) so any caller who
+ * already holds an OpenDota key can escape the shared-IP throttle today, and so
+ * wiring a future `platformKeyEnv: 'PLATFORM_OPENDOTA_KEY'` in the manifest is a
+ * one-line change once a key exists — no further pack edit needed.
  */
 
 
@@ -689,6 +721,14 @@ async function pwFetch(url: string | URL, init?: RequestInit): Promise<Response>
 const BASE = 'https://api.opendota.com/api';
 const UA = 'pipeworx/1.0 (+https://pipeworx.io)';
 
+const API_KEY_PROP = {
+  type: 'string' as const,
+  description:
+    'Optional — your own OpenDota API key (free, from https://www.opendota.com/api-keys) for higher, PER-KEY rate limits. ' +
+    'The endpoint is keyless: omit this and calls still work, but OpenDota rate-limits by calling IP and the shared Worker ' +
+    'egress IP is frequently already at quota from unrelated traffic — a caller-supplied key escapes that.',
+};
+
 const tools: McpToolExport['tools'] = [
   {
     name: 'hero_stats',
@@ -699,6 +739,7 @@ const tools: McpToolExport['tools'] = [
       properties: {
         role: { type: 'string', description: 'Optional role filter, e.g. "Carry", "Support", "Initiator".' },
         limit: { type: 'number', description: 'Max heroes to return (default 30).' },
+        _apiKey: API_KEY_PROP,
       },
     },
   },
@@ -710,6 +751,7 @@ const tools: McpToolExport['tools'] = [
       type: 'object',
       properties: {
         limit: { type: 'number', description: 'Max matches to return (default 20, max 100).' },
+        _apiKey: API_KEY_PROP,
       },
     },
   },
@@ -722,6 +764,7 @@ const tools: McpToolExport['tools'] = [
       properties: {
         name: { type: 'string', description: 'Persona / display name to search for.' },
         limit: { type: 'number', description: 'Max players to return (default 10).' },
+        _apiKey: API_KEY_PROP,
       },
       required: ['name'],
     },
@@ -734,6 +777,7 @@ const tools: McpToolExport['tools'] = [
       type: 'object',
       properties: {
         account_id: { type: ['number', 'string'], description: 'Steam32 account ID.' },
+        _apiKey: API_KEY_PROP,
       },
       required: ['account_id'],
     },
@@ -741,16 +785,18 @@ const tools: McpToolExport['tools'] = [
 ];
 
 async function callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
+  const apiKey = typeof args._apiKey === 'string' && args._apiKey.trim() ? args._apiKey.trim() : undefined;
+  delete args._apiKey;
   try {
     switch (name) {
       case 'hero_stats':
-        return await heroStats(args);
+        return await heroStats(args, apiKey);
       case 'pro_matches':
-        return await proMatches(args);
+        return await proMatches(args, apiKey);
       case 'search_players':
-        return await searchPlayers(args);
+        return await searchPlayers(args, apiKey);
       case 'get_player':
-        return await getPlayer(args);
+        return await getPlayer(args, apiKey);
       default:
         return { error: `Unknown tool: ${name}` };
     }
@@ -761,18 +807,32 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
 
 class RateLimited extends Error {}
 
-async function odGet(path: string): Promise<Response> {
-  const res = await pwFetch(`${BASE}${path}`, { headers: { Accept: 'application/json', 'User-Agent': UA } });
-  if (res.status === 429) throw new RateLimited('OpenDota rate limit; try again shortly');
+// `path` must not already carry a `?` — every call site below passes a bare
+// resource path or one with its own query string appended via `withKey`.
+function withKey(path: string, apiKey: string | undefined): string {
+  if (!apiKey) return path;
+  const sep = path.includes('?') ? '&' : '?';
+  return `${path}${sep}api_key=${encodeURIComponent(apiKey)}`;
+}
+
+async function odGet(path: string, apiKey?: string): Promise<Response> {
+  const res = await pwFetch(`${BASE}${withKey(path, apiKey)}`, { headers: { Accept: 'application/json', 'User-Agent': UA } });
+  if (res.status === 429) {
+    throw new RateLimited(
+      'upstream_throttled: OpenDota rate limit (HTTP 429). OpenDota limits by calling IP and the shared egress is often ' +
+        'already at quota from unrelated traffic; pass your own free key via _apiKey (https://www.opendota.com/api-keys) ' +
+        'for a per-key limit, or try again shortly without one.',
+    );
+  }
   if (!res.ok) throw new Error(`OpenDota: ${res.status} ${(await res.text()).slice(0, 200)}`);
   return res;
 }
 
-async function heroStats(args: Record<string, unknown>): Promise<unknown> {
+async function heroStats(args: Record<string, unknown>, apiKey: string | undefined): Promise<unknown> {
   try {
     const limit = numArg(args.limit, 30);
     const role = typeof args.role === 'string' && args.role.trim() ? args.role.trim().toLowerCase() : null;
-    const res = await odGet('/heroStats');
+    const res = await odGet('/heroStats', apiKey);
     const data = (await res.json()) as Array<Record<string, unknown>>;
     let heroes = Array.isArray(data) ? data : [];
     if (role) {
@@ -793,15 +853,15 @@ async function heroStats(args: Record<string, unknown>): Promise<unknown> {
     }));
     return { count: out.length, heroes: out };
   } catch (e) {
-    if (e instanceof RateLimited) return { error: 'OpenDota rate limit; try again shortly' };
+    if (e instanceof RateLimited) return { error: e.message };
     throw e;
   }
 }
 
-async function proMatches(args: Record<string, unknown>): Promise<unknown> {
+async function proMatches(args: Record<string, unknown>, apiKey: string | undefined): Promise<unknown> {
   try {
     const limit = Math.min(numArg(args.limit, 20), 100);
-    const res = await odGet('/proMatches');
+    const res = await odGet('/proMatches', apiKey);
     const data = (await res.json()) as Array<Record<string, unknown>>;
     const matches = Array.isArray(data) ? data : [];
     const out = matches.slice(0, limit).map((m) => ({
@@ -815,16 +875,16 @@ async function proMatches(args: Record<string, unknown>): Promise<unknown> {
     }));
     return { count: out.length, matches: out };
   } catch (e) {
-    if (e instanceof RateLimited) return { error: 'OpenDota rate limit; try again shortly' };
+    if (e instanceof RateLimited) return { error: e.message };
     throw e;
   }
 }
 
-async function searchPlayers(args: Record<string, unknown>): Promise<unknown> {
+async function searchPlayers(args: Record<string, unknown>, apiKey: string | undefined): Promise<unknown> {
   try {
     const name = reqStr(args, 'name');
     const limit = numArg(args.limit, 10);
-    const res = await odGet(`/search?q=${encodeURIComponent(name)}`);
+    const res = await odGet(`/search?q=${encodeURIComponent(name)}`, apiKey);
     let data: unknown;
     try {
       data = await res.json();
@@ -839,16 +899,16 @@ async function searchPlayers(args: Record<string, unknown>): Promise<unknown> {
     }));
     return { count: out.length, players: out };
   } catch (e) {
-    if (e instanceof RateLimited) return { error: 'OpenDota rate limit; try again shortly' };
+    if (e instanceof RateLimited) return { error: e.message };
     throw e;
   }
 }
 
-async function getPlayer(args: Record<string, unknown>): Promise<unknown> {
+async function getPlayer(args: Record<string, unknown>, apiKey: string | undefined): Promise<unknown> {
   try {
     const id = reqStr(args, 'account_id');
     const enc = encodeURIComponent(id);
-    const [pRes, wlRes] = await Promise.all([odGet(`/players/${enc}`), odGet(`/players/${enc}/wl`)]);
+    const [pRes, wlRes] = await Promise.all([odGet(`/players/${enc}`, apiKey), odGet(`/players/${enc}/wl`, apiKey)]);
     const player = (await pRes.json()) as Record<string, unknown>;
     const wl = (await wlRes.json()) as Record<string, unknown>;
     const profile = player.profile as Record<string, unknown> | null | undefined;
@@ -863,7 +923,7 @@ async function getPlayer(args: Record<string, unknown>): Promise<unknown> {
       losses: wl?.lose,
     };
   } catch (e) {
-    if (e instanceof RateLimited) return { error: 'OpenDota rate limit; try again shortly' };
+    if (e instanceof RateLimited) return { error: e.message };
     throw e;
   }
 }
